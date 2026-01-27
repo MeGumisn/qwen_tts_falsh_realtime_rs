@@ -1,0 +1,9 @@
+[package]
+name = "qwen_tts_falsh_realtime_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio-tungstenite= { version = "0.28.0",features = ["native-tls"] }
+tokio = { version = "1.49.0",features = ["full"] }
+futures-util = "0.3.31"
