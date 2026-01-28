@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = {version = "1.0.149", features = ["default"]}
+
 tokio-tungstenite= { version = "0.28.0",features = ["native-tls"] }
 tokio = { version = "1.49.0",features = ["full"] }
 futures-util = "0.3.31"
+uuid = { version = "1.20.0", features = ["v4"] }
+
+log = "0.4.29"
+flexi_logger = "0.31.8"
