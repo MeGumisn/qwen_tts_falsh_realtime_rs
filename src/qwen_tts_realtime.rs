@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -44,7 +45,7 @@ impl<'a> AudioFormat<'a> {
 trait QwenTtsRealtimeCallback {
     fn on_open(&self);
     fn on_close(&self, close_msg: &str);
-    fn on_event(&self, message: &str);
+    fn on_event(&mut self, message: &str) -> bool;
 }
 
 struct QwenTtsRealtime {
@@ -59,7 +60,7 @@ impl QwenTtsRealtime {
         api_key: &str,
         url: Option<&str>,
         workspace: Option<&str>,
-        callback: Arc<Option<Box<dyn QwenTtsRealtimeCallback + Sync + Send>>>,
+        callback: Option<Arc<Mutex<Box<dyn QwenTtsRealtimeCallback + Sync + Send>>>>,
     ) -> Self {
         let url = if let Some(url) = url {
             format!("{}?model={}", url, model_name)
@@ -96,37 +97,47 @@ impl QwenTtsRealtime {
         response.headers().into_iter().for_each(|(name, value)| {
             log::info!("响应头: {}: {:?}", name, value);
         });
-        if let Some(callback) = callback.as_ref() {
-            callback.on_open();
-        }
+
         let (stream_writer, mut stream_reader) = stream.split();
-        tokio::spawn(async move {
-            while let Some(message) = stream_reader.next().await {
-                match message {
-                    Ok(msg) => {
-                        if msg.is_text() {
-                            log::info!("text message: {:?}", msg);
-                            if let Some(callback) = callback.as_ref() {
-                                callback.on_event(msg.to_text().unwrap());
+        // 有回调时这里异步任务循环维持连接， 没有回调时，这个函数结束stream就自动close了
+        if let Some(callback) = callback {
+            callback.lock().await.as_ref().on_open();
+            tokio::spawn(async move {
+                let callback_clone = callback.clone();
+                while let Some(message) = stream_reader.next().await {
+                    match message {
+                        Ok(msg) => {
+                            if msg.is_text() {
+                                log::info!("text message: {:?}", msg);
+                                let need_aborted = callback_clone
+                                    .lock()
+                                    .await
+                                    .as_mut()
+                                    .on_event(msg.to_text().unwrap());
+                                if need_aborted {
+                                    break;
+                                }
+                            } else if msg.is_close() {
+                                log::info!("close: {:?}", msg);
+                                callback_clone
+                                    .lock()
+                                    .await
+                                    .as_ref()
+                                    .on_close("Connection closed by server");
+                                break;
+                            } else {
+                                log::info!("other message: {:?}", msg);
                             }
-                        } else if msg.is_close() {
-                            log::info!("close: {:?}", msg);
-                            if let Some(callback) = callback.as_ref() {
-                                callback.on_close("Connection closed by server");
-                            }
+                        }
+                        Err(e) => {
+                            log::error!("Error receiving message: {}", e);
                             break;
-                        } else {
-                            log::info!("other message: {:?}", msg);
                         }
                     }
-                    Err(e) => {
-                        log::error!("Error receiving message: {}", e);
-                        break;
-                    }
                 }
-            }
-            log::info!("reader task ended");
-        });
+                log::info!("reader task ended");
+            });
+        }
         Self { stream_writer }
     }
 
@@ -170,13 +181,27 @@ impl QwenTtsRealtime {
             .await?;
         Ok(())
     }
+
+    async fn finish(&mut self) -> Result<(), Error> {
+        let msg = json!({
+            "event_id": self._generate_event_id(),
+            "type": "session.finish"
+        });
+        self.stream_writer
+            .send(Message::text(msg.to_string()))
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::logging::init_logger;
-    use std::fs::{File, create_dir_all};
+    use base64::Engine;
+    use log::__private_api::log;
+    use std::fs::{File, OpenOptions, create_dir_all};
+    use std::io::Write;
     use std::path::Path;
 
     struct MyCallback {
@@ -186,33 +211,68 @@ mod tests {
     impl MyCallback {
         fn new(filename: &str) -> Self {
             let p = Path::new(filename);
-            let file;
             if !p.exists() || !p.is_file() {
                 if let Some(parent) = p.parent() {
                     create_dir_all(parent).unwrap();
                 }
-                file = File::create(p).unwrap();
-            } else {
-                file = File::open(p).unwrap();
             }
+            let file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(p)
+                .unwrap();
             Self { file: file }
         }
     }
     impl QwenTtsRealtimeCallback for MyCallback {
         fn on_open(&self) {
-            println!("Connection opened");
+            log::info!("Connection opened");
         }
 
         fn on_close(&self, close_msg: &str) {
-            println!("Connection closed: {}", close_msg);
+            log::info!("Connection closed: {}", close_msg);
         }
 
-        fn on_event(&self, message: &str) {
-            println!("Received event: {}", message);
+        fn on_event(&mut self, message: &str) -> bool {
+            log::info!("Received event: {}", message);
+            let v: serde_json::Value = serde_json::from_str(message).unwrap();
+            if let Some(event_type) = v.get("type") {
+                if let Some(event_type_str) = event_type.as_str() {
+                    match event_type_str {
+                        "session.created" => {
+                            log::info!("event: session created");
+                        }
+                        "response.audio.delta" => {
+                            log::info!("event: response audio delta");
+                            if let Some(recv_audio_b64) = v.get("delta") {
+                                if let Some(recv_audio_b64_str) = recv_audio_b64.as_str() {
+                                    let audio_bytes = base64::engine::general_purpose::STANDARD
+                                        .decode(recv_audio_b64_str)
+                                        .unwrap();
+                                    self.file.write(&audio_bytes).unwrap();
+                                }
+                            }
+                        }
+                        "response.done" => {
+                            log::info!("event: response done");
+                        }
+                        "session.finished" => {
+                            log::info!("event: session finished");
+                            return true;
+                        }
+                        _ => {
+                            log::info!("unknown event type: {}", event_type_str);
+                        }
+                    }
+                }
+            }
+            false
         }
     }
 
-    async fn prepare_qwen_tts_realtime<T>(callback: Arc<Option<T>>) -> QwenTtsRealtime {
+    async fn prepare_qwen_tts_realtime(
+        callback: Option<Arc<Mutex<Box<dyn QwenTtsRealtimeCallback + Sync + Send>>>>,
+    ) -> QwenTtsRealtime {
         init_logger("info");
         let api_key = std::env::var("DASHSCOPE_API_KEY").unwrap();
         log::info!("{}", api_key);
@@ -221,13 +281,13 @@ mod tests {
             api_key.as_str(),
             Some("wss://dashscope.aliyuncs.com/api-ws/v1/realtime"),
             None,
-            Arc::new(None),
+            callback,
         )
         .await
     }
     #[tokio::test]
     async fn test_update_session() {
-        let mut qwen_tts_realtime = prepare_qwen_tts_realtime::<u32>(Arc::new(None)).await;
+        let mut qwen_tts_realtime = prepare_qwen_tts_realtime(None).await;
         let _ = qwen_tts_realtime
             .update_session(
                 "Cherry",
@@ -241,35 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_text() {
-        let text_to_synthesize = [
-            "对吧~我就特别喜欢这种超市，",
-            "尤其是过年的时候",
-            "去逛超市",
-            "就会觉得",
-            "超级超级开心！",
-            "想买好多好多的东西呢。",
-        ];
-        let mut qwen_tts_realtime = prepare_qwen_tts_realtime::<u32>(Arc::new(None)).await;
-        let _ = qwen_tts_realtime
-            .update_session(
-                "Cherry",
-                AudioFormat::PCM_24000HZ_MONO_16BIT,
-                "server_commit",
-            )
-            .await;
-        for text in text_to_synthesize.iter() {
-            let _ = qwen_tts_realtime.append_text(text).await;
-        }
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for event");
-    }
-
-    #[tokio::test]
-    async fn test_tts_generate() {
-        let mut qwen_tts_realtime =
-            prepare_qwen_tts_realtime(Arc::new(Some(Box::new(MyCallback::new("result_24k.pcm")))))
-                .await;
+        let mut qwen_tts_realtime = prepare_qwen_tts_realtime(None).await;
         let _ = qwen_tts_realtime
             .update_session(
                 "Cherry",
@@ -280,6 +312,37 @@ mod tests {
         let _ = qwen_tts_realtime
             .append_text("你好，欢迎使用Qwen TTS实时语音合成服务。")
             .await;
+
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for event");
+    }
+
+    #[tokio::test]
+    async fn test_tts_generate() {
+        let text_to_synthesize = [
+            "对吧~我就特别喜欢这种超市，",
+            "尤其是过年的时候",
+            "去逛超市",
+            "就会觉得",
+            "超级超级开心！",
+            "想买好多好多的东西呢。",
+        ];
+        let mut qwen_tts_realtime = prepare_qwen_tts_realtime(Some(Arc::new(Mutex::new(
+            Box::new(MyCallback::new("result_24k.pcm")),
+        ))))
+        .await;
+        let _ = qwen_tts_realtime
+            .update_session(
+                "Cherry",
+                AudioFormat::PCM_24000HZ_MONO_16BIT,
+                "server_commit",
+            )
+            .await;
+        for text in text_to_synthesize.iter() {
+            let _ = qwen_tts_realtime.append_text(text).await;
+        }
+        let _ = qwen_tts_realtime.finish().await;
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to listen for event");

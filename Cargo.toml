@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = {version = "1.0.149", features = ["default"]}
+base64 = "0.22.1"
 
 tokio-tungstenite= { version = "0.28.0",features = ["native-tls"] }
 tokio = { version = "1.49.0",features = ["full"] }
