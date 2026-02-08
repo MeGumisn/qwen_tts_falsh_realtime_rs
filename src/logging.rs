@@ -28,7 +28,7 @@ pub(crate) fn init_logger(level: &str) -> LoggerHandle {
         .log_to_file(
             FileSpec::default()
                 .directory("logs") // 日志保存目录
-                .basename("myapp"), // 文件名前缀
+                .basename("qwen-tts-flash-realtime-rs"), // 文件名前缀
         )
         .rotate(
             Criterion::Age(flexi_logger::Age::Day), // 每天午夜切割

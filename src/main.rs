@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
+mod dashscope_rs;
 mod logging;
+mod odps_rs;
 mod qwen_tts_realtime;
 
 struct MyCallback {
@@ -52,33 +54,33 @@ impl QwenTtsRealtimeCallback for MyCallback {
     fn on_event(&mut self, message: &str) -> bool {
         log::info!("Received event: {}", message);
         let v: serde_json::Value = serde_json::from_str(message).unwrap();
-        if let Some(event_type) = v.get("type") {
-            if let Some(event_type_str) = event_type.as_str() {
-                match event_type_str {
-                    "session.created" => {
-                        log::info!("event: session created");
+        if let Some(event_type) = v.get("type")
+            && let Some(event_type_str) = event_type.as_str()
+        {
+            match event_type_str {
+                "session.created" => {
+                    log::info!("event: session created");
+                }
+                "response.audio.delta" => {
+                    log::info!("event: response audio delta");
+                    if let Some(recv_audio_b64) = v.get("delta")
+                        && let Some(recv_audio_b64_str) = recv_audio_b64.as_str()
+                    {
+                        let audio_bytes = base64::engine::general_purpose::STANDARD
+                            .decode(recv_audio_b64_str)
+                            .unwrap();
+                        self.file.write_all(&audio_bytes).unwrap();
                     }
-                    "response.audio.delta" => {
-                        log::info!("event: response audio delta");
-                        if let Some(recv_audio_b64) = v.get("delta") {
-                            if let Some(recv_audio_b64_str) = recv_audio_b64.as_str() {
-                                let audio_bytes = base64::engine::general_purpose::STANDARD
-                                    .decode(recv_audio_b64_str)
-                                    .unwrap();
-                                self.file.write(&audio_bytes).unwrap();
-                            }
-                        }
-                    }
-                    "response.done" => {
-                        log::info!("event: response done");
-                    }
-                    "session.finished" => {
-                        log::info!("event: session finished");
-                        return true;
-                    }
-                    _ => {
-                        log::info!("unknown event type: {}", event_type_str);
-                    }
+                }
+                "response.done" => {
+                    log::info!("event: response done");
+                }
+                "session.finished" => {
+                    log::info!("event: session finished");
+                    return true;
+                }
+                _ => {
+                    log::info!("unknown event type: {}", event_type_str);
                 }
             }
         }
@@ -114,13 +116,10 @@ async fn main() {
     }
     let _ = qwen_tts_realtime.finish().await;
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                if session_finished.load(Ordering::Relaxed) {
-                    println!("TTS 任務已自動完成。");
-                    break;
-                }
-            }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if session_finished.load(Ordering::Relaxed) {
+            println!("TTS 任務已自動完成。");
+            break;
         }
     }
 }
