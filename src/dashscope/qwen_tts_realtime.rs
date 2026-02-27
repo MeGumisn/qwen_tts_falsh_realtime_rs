@@ -1,4 +1,4 @@
-use crate::logging::init_logger;
+use crate::common::logging::init_logger;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;

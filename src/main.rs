@@ -1,16 +1,15 @@
-use crate::qwen_tts_realtime::{AudioFormat, QwenTtsRealtimeCallback, prepare_qwen_tts_realtime};
+use dashscope::qwen_tts_realtime::{prepare_qwen_tts_realtime, AudioFormat, QwenTtsRealtimeCallback};
 use base64::Engine;
-use std::fs::{File, OpenOptions, create_dir_all};
+use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
-mod dashscope_rs;
-mod logging;
-mod odps_rs;
-mod qwen_tts_realtime;
+pub mod dashscope;
+pub mod odps;
+pub mod common;
 
 struct MyCallback {
     file: File,
