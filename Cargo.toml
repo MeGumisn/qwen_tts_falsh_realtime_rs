@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = {version = "1.0.149", features = ["default"]}
-base64 = "0.22.1"
+base64 = { version = "0.22.1", features = ["default","alloc"] }
 
 tokio-tungstenite= { version = "0.28.0",features = ["native-tls"] }
 tokio = { version = "1.49.0",features = ["full"] }
@@ -23,6 +23,14 @@ flexi_logger = "0.31.8"
 raw-cpuid = "11.0"
 rustc_version = "0.4.0"
 
+chrono = "0.4.44"
+hmac = "0.12.1"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+
+bstr = "1.12.1"
+regex = "1.12.2"
+url = "2.5.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-version = "0.1"
