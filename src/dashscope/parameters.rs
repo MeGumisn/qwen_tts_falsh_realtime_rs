@@ -1,15 +1,78 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Error, Value};
+use serde_json::{Error, Value, json};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Tool {
+    r#type: String,
+    function: Function,
+}
+impl Tool {
+    ///
+    /// parameters 元组第一个&str放param的入参名
+    pub fn new(
+        r#type: &str,
+        function_name: &str,
+        function_desc: &str,
+        parameters: Vec<(&str, FunctionParameters)>,
+    ) -> Self {
+        let mut params = json!({});
+        parameters.into_iter().for_each(|(name, function_params)| {
+            params[name] =
+                serde_json::to_value(function_params).unwrap_or(Value::String(String::new()));
+        });
+        let function = Function {
+            name: function_name.to_string(),
+            description: function_desc.to_string(),
+            parameters: params,
+        };
+        Self {
+            r#type: r#type.to_string(),
+            function,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Function {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FunctionParameters {
+    r#type: String,
+    properties: FunctionProperties,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FunctionProperties {
+    r#type: String,
+    description: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Message {
     role: String,
     content: String,
+    // 回傳結果時需要
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 impl Message {
     pub fn new(role: String, content: String) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn new_tool_call(role: String, content: String, tool_call_id: Option<String>) -> Self {
+        Self {
+            role,
+            content,
+            tool_call_id,
+        }
     }
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,7 +115,7 @@ impl<'a> DashScopeRequestBodyBuilder<'a> {
         prompt: Option<&'a str>,
         history: Option<Vec<HistoryMessage>>,
         messages: Option<Vec<Message>>,
-        parameter: Parameters
+        parameter: Parameters,
     ) -> Self {
         Self {
             model,
