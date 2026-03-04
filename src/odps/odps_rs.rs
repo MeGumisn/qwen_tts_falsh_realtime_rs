@@ -38,7 +38,7 @@ where
         endpoint: &str,
         project_name: &str,
     ) -> Result<String, GenerationError> {
-        /// https://service.cn-hangzhou.maxcompute.aliyun.com/api/projects/test_dat_maxcompute/tunnel?service
+        // https://service.cn-hangzhou.maxcompute.aliyun.com/api/projects/test_dat_maxcompute/tunnel?service
         let url_str = format!("{}/projects/{}/tunnel?service", endpoint, project_name);
         let response = rest_client
             .request(url_str.as_str(), Method::GET, endpoint, None)
@@ -67,13 +67,19 @@ where
 
     pub async fn create_download_session(
         &self,
+        project_name: Option<&str>,
         table_name: &str,
         partition_spec: Option<&str>,
     ) -> Result<TunnelDownloadSession, GenerationError> {
+        let project_name: &str = match project_name {
+            Some(project_name) => project_name.into(),
+            None => self.project_name.into(),
+        };
+
         let url_str = if let Some(partition_spec) = partition_spec {
             format!(
                 "{}/projects/{}/tables/{}?downloads=&partition_spec={}&asyncmode=true",
-                self.tunnel_endpoint, self.project_name, table_name, partition_spec
+                self.tunnel_endpoint, project_name, table_name, partition_spec
             )
         } else {
             format!(
@@ -84,7 +90,12 @@ where
         let mut headers = HeaderMap::new();
         /// headers:
         /// ```json
-        /// {'odps-tunnel-date-transform': 'v1', 'odps-tunnel-sdk-support-schema-evolution': 'true', 'x-odps-tunnel-version': 6, 'Content-Length': 0}
+        /// {
+        ///     "odps-tunnel-date-transform": "v1",
+        ///     "odps-tunnel-sdk-support-schema-evolution": "true",
+        ///     "x-odps-tunnel-version": "6",
+        ///     "Content-Length": "0"
+        /// }
         /// ```
         headers.insert("odps-tunnel-date-transform", "v1".parse()?);
         headers.insert("odps-tunnel-sdk-support-schema-evolution", "true".parse()?);
@@ -108,13 +119,22 @@ where
             serde_json::from_str::<TunnelDownloadSession>(&download_session_text)?;
         Ok(download_session)
     }
+
+    pub async fn open_arrow_reader(
+        &self,
+        project_name: Option<&str>,
+        table_name: &str,
+        partition_spec: Option<&str>,
+        range: (usize, usize),
+    ) {
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use log::info;
     use super::*;
     use crate::odps::account::test_account;
+    use log::info;
     #[tokio::test]
     async fn test_get_tunnel_host() {
         let account = test_account();
@@ -140,7 +160,7 @@ mod tests {
         )
         .await;
         let download_session = odps
-            .create_download_session("json_string", None)
+            .create_download_session(None, "json_string", None)
             .await
             .unwrap();
         info!("{:#?}", download_session);
