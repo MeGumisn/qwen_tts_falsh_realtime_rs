@@ -1,5 +1,10 @@
-use std::io;
+use crate::odps::constants::ODPS_TO_ARROW_MAPPING;
+use crate::odps::models::TunnelTableSchema;
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message};
+use arrow_schema::ArrowError;
 use bytes::{Buf, Bytes};
+use std::io;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
@@ -95,5 +100,40 @@ impl Seek for SkippedCursor<'_> {
         // 更新位置（允許 seek 到超出總長度，這符合標準庫 Cursor 的行為）
         self.position = new_pos as usize;
         Ok(self.position as u64)
+    }
+}
+
+pub struct OdpsArrowReader {
+    arrow_schema_bytes: Arc<Vec<u8>>,
+}
+
+impl OdpsArrowReader {
+    pub fn new(tunnel_schema: &TunnelTableSchema) -> Result<Self, ArrowError> {
+        let arrow_schema = ODPS_TO_ARROW_MAPPING.odps_to_arrow_schema(tunnel_schema)?;
+        let mut schema_bytes = Vec::new();
+        // write the schema, set the written bytes to the schema
+        let data_gen = IpcDataGenerator::default();
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        let write_options = IpcWriteOptions::default();
+        let encoded_message = data_gen.schema_to_bytes_with_dictionary_tracker(
+            &arrow_schema,
+            &mut dictionary_tracker,
+            &write_options,
+        );
+
+        let (_aligned_size, _body_len) =
+            write_message(&mut schema_bytes, encoded_message, &write_options)?;
+        let schema_bytes_arc = Arc::new(schema_bytes);
+        Ok(Self {
+            arrow_schema_bytes: schema_bytes_arc,
+        })
+    }
+
+    pub fn open_arrow_reader<'a>(
+        &self,
+        bytes: &'a mut Bytes,
+    ) -> Result<StreamReader<SkippedCursor<'a>>, ArrowError> {
+        let cursor = SkippedCursor::new(self.arrow_schema_bytes.clone(), bytes);
+        Ok(StreamReader::try_new(cursor, None)?)
     }
 }

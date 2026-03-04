@@ -35,6 +35,7 @@ sha2 = "0.10.9"
 bstr = "1.12.1"
 regex = "1.12.2"
 url = "2.5.8"
+lazy_static = "1.5.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-version = "0.1"
