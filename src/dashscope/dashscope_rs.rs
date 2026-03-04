@@ -195,7 +195,7 @@ mod tests {
             model,
             None,
             None,
-            env!("DASHSCOPE_API_KEY").to_string().as_str(),
+            env!("DASHSCOPE_API_KEY"),
             Some(messages),
             None,
             None,

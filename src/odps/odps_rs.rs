@@ -1,12 +1,49 @@
-struct Odps<'a> {
-    ak: &'a str,
-    sk: &'a str,
+use crate::common::errors::GenerationError;
+use crate::odps::account::SignRequest;
+use crate::odps::models::TunnelDownloadSession;
+use crate::odps::rest_client::RestClient;
+use reqwest::Method;
+use tokio_tungstenite::tungstenite::http::HeaderMap;
+
+struct Odps<'a, T>
+where
+    T: SignRequest,
+{
+    project_name: &'a str,
     endpoint: &'a str,
+    tunnel_endpoint: String,
+    rest_client: RestClient<T>,
 }
 
-impl<'a> Odps<'a> {
-    pub fn new(ak: &'a str, sk: &'a str, endpoint: &'a str) -> Self {
-        Odps { ak, sk, endpoint }
+impl<'a, T> Odps<'a, T>
+where
+    T: SignRequest,
+{
+    pub async fn new(account: T, endpoint: &'a str, project_name: &'a str) -> Self {
+        let rest_client = RestClient::new(account);
+        let tunnel_host = Self::get_tunnel_host(&rest_client, endpoint, project_name)
+            .await
+            .unwrap_or("".into());
+        let tunnel_endpoint = format!("https://{}", tunnel_host);
+        Self {
+            project_name,
+            endpoint,
+            tunnel_endpoint,
+            rest_client,
+        }
+    }
+
+    async fn get_tunnel_host(
+        rest_client: &RestClient<T>,
+        endpoint: &str,
+        project_name: &str,
+    ) -> Result<String, GenerationError> {
+        /// https://service.cn-hangzhou.maxcompute.aliyun.com/api/projects/test_dat_maxcompute/tunnel?service
+        let url_str = format!("{}/projects/{}/tunnel?service", endpoint, project_name);
+        let response = rest_client
+            .request(url_str.as_str(), Method::GET, endpoint, None)
+            .await?;
+        Ok(response.text().await?)
     }
 
     ///
@@ -19,5 +56,93 @@ impl<'a> Odps<'a> {
     ///   "Authorization": "ODPS **your access id**/20260204/cn/odps/aliyun_v4_request:LJpwqdeznLSpwMCB2XZK0yp00qY="
     /// }
     /// ```
-    pub fn get_project(project_name: &str, schema_name: Option<&str>) {}
+    pub async fn get_logview_host(&self) -> Result<String, GenerationError> {
+        let url_str = format!("{}/logview/host", self.endpoint);
+        let response = self
+            .rest_client
+            .request(url_str.as_str(), Method::GET, self.endpoint, None)
+            .await?;
+        Ok(response.text().await?)
+    }
+
+    pub async fn create_download_session(
+        &self,
+        table_name: &str,
+        partition_spec: Option<&str>,
+    ) -> Result<TunnelDownloadSession, GenerationError> {
+        let url_str = if let Some(partition_spec) = partition_spec {
+            format!(
+                "{}/projects/{}/tables/{}?downloads=&partition_spec={}&asyncmode=true",
+                self.tunnel_endpoint, self.project_name, table_name, partition_spec
+            )
+        } else {
+            format!(
+                "{}/projects/{}/tables/{}?downloads=&asyncmode=true",
+                self.tunnel_endpoint, self.project_name, table_name
+            )
+        };
+        let mut headers = HeaderMap::new();
+        /// headers:
+        /// ```json
+        /// {'odps-tunnel-date-transform': 'v1', 'odps-tunnel-sdk-support-schema-evolution': 'true', 'x-odps-tunnel-version': 6, 'Content-Length': 0}
+        /// ```
+        headers.insert("odps-tunnel-date-transform", "v1".parse()?);
+        headers.insert("odps-tunnel-sdk-support-schema-evolution", "true".parse()?);
+        headers.insert("x-odps-tunnel-version", "6".parse()?);
+        headers.insert("Content-Length", "0".parse()?);
+        // ODPS LTAI5tKSLbi8M5UmbBtXxKW4:vgFwyabNyS8zUPchd9bPf8gZras=
+        // #[cfg(test)]
+        // headers.insert("Date", "Wed, 04 Mar 2026 00:59:10 GMT".parse()?);
+
+        let response = self
+            .rest_client
+            .request(
+                url_str.as_str(),
+                Method::POST,
+                self.tunnel_endpoint.as_str(),
+                Some(headers),
+            )
+            .await?;
+        let download_session_text = response.text().await?;
+        let download_session =
+            serde_json::from_str::<TunnelDownloadSession>(&download_session_text)?;
+        Ok(download_session)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use log::info;
+    use super::*;
+    use crate::odps::account::test_account;
+    #[tokio::test]
+    async fn test_get_tunnel_host() {
+        let account = test_account();
+        let odps = Odps::new(
+            account,
+            "https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+            "test_dat_maxcompute",
+        )
+        .await;
+        let tunnel_host = &odps.tunnel_endpoint;
+        println!("{}", *tunnel_host);
+        let logview_host = odps.get_logview_host().await.unwrap();
+        println!("{}", logview_host);
+    }
+
+    #[tokio::test]
+    async fn test_create_download_session() {
+        let account = test_account();
+        let odps = Odps::new(
+            account,
+            "https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+            "test_dat_maxcompute",
+        )
+        .await;
+        let download_session = odps
+            .create_download_session("json_string", None)
+            .await
+            .unwrap();
+        info!("{:#?}", download_session);
+    }
 }

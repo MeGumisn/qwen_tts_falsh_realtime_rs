@@ -67,7 +67,7 @@ impl Message {
         }
     }
 
-    pub fn new_tool_call(role: String, content: String, tool_call_id: Option<String>) -> Self {
+    pub fn new_with_tool_call(role: String, content: String, tool_call_id: Option<String>) -> Self {
         Self {
             role,
             content,
