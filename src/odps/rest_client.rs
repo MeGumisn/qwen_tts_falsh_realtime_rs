@@ -1,10 +1,10 @@
 use crate::common::errors::GenerationError;
 use crate::odps::account::SignRequest;
-use log::debug;
 use regex::Regex;
 use reqwest::{Client, Method, Response, Url};
 use std::str::FromStr;
 use tokio_tungstenite::tungstenite::http::HeaderMap;
+
 
 pub struct RestClient<T>
 where
@@ -35,6 +35,7 @@ where
         method: Method,
         endpoint: &'a str,
         header_map: Option<HeaderMap>,
+        body: Option<Vec<u8>>,
     ) -> Result<Response, GenerationError> {
         let mut request_builder = self
             .client
@@ -42,6 +43,9 @@ where
             .header("User-Agent", self.odps_ua());
         if let Some(header_map) = header_map {
             request_builder = request_builder.headers(header_map);
+        }
+        if let Some(body) = body {
+            request_builder = request_builder.body(body);
         }
         let mut request = request_builder.build()?;
         match Self::get_region_name(endpoint) {
@@ -52,8 +56,10 @@ where
             Err(_) => 
                 self.account.sign_request(&mut request, endpoint, None)?,
         }
-        #[cfg(test)]
-        debug!("{:#?}", request);
+        #[cfg(test)]{
+            use log::debug;
+            debug!("{:#?}", request);
+        }
         Ok(self.client.execute(request).await?)
     }
 
@@ -85,6 +91,7 @@ mod tests {
                 "https://service.cn-hangzhou.maxcompute.aliyun.com/api/logview/host",
                 Method::GET,
                 "https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+                None,
                 None,
             )
             .await

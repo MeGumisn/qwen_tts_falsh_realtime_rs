@@ -80,3 +80,23 @@ pub struct TunnelTableColumn {
     #[serde(rename = "type")]
     pub r#type: String,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TunnelUploadSession {
+    #[serde(rename = "Initiated")]
+    pub initiated: String,
+    #[serde(rename = "IsOverwrite")]
+    pub is_overwrite: bool,
+    #[serde(rename = "MaxFieldSize")]
+    pub max_field_size: i32,
+    #[serde(rename = "Owner")]
+    pub owner: String,
+    #[serde(rename = "QuotaName")]
+    pub quota_name: String,
+    #[serde(rename = "Schema")]
+    pub schema: TunnelTableSchema,
+    #[serde(rename = "Status")]
+    pub status: String,
+    #[serde(rename = "UploadID")]
+    pub upload_id: String,
+}

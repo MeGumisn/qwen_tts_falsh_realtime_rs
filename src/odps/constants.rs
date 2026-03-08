@@ -3,8 +3,25 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use lazy_static::lazy_static;
 use std::collections::BTreeMap;
 
+#[clippy::format_args]
+macro_rules! insert_default_tunnel_header {
+    ($header_map: expr) => {
+        $header_map.insert("odps-tunnel-date-transform", "v1".parse()?);
+        $header_map.insert("odps-tunnel-sdk-support-schema-evolution", "true".parse()?);
+        $header_map.insert("x-odps-tunnel-version", "6".parse()?);
+        $header_map.insert("Content-Length", "0".parse()?);
+    };
+}
+pub(super) use insert_default_tunnel_header;
+
 pub struct OdpsToArrowSchema<'a> {
     odps_to_arrow_type_mapping: BTreeMap<&'a str, DataType>,
+}
+
+impl<'a> Default for OdpsToArrowSchema<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<'a> OdpsToArrowSchema<'a> {
@@ -55,5 +72,5 @@ impl<'a> OdpsToArrowSchema<'a> {
 }
 
 lazy_static! {
-    pub static ref ODPS_TO_ARROW_MAPPING: OdpsToArrowSchema<'static> = OdpsToArrowSchema::new();
+    pub static ref ODPS_TO_ARROW_MAPPING: OdpsToArrowSchema<'static> = OdpsToArrowSchema::default();
 }

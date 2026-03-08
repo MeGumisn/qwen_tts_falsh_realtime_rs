@@ -1,3 +1,4 @@
+use arrow_schema::ArrowError;
 use hmac::digest::InvalidLength;
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::http;
@@ -27,4 +28,7 @@ pub enum GenerationError {
 
     #[error("Odps endpoint查找region信息错误: {0}")]
     NoRegionInEndpointError(#[from] regex::Error),
+
+    #[error("Odps 发送arrow数据失败: {0}")]
+    OdpsArrowError(#[from] ArrowError)
 }

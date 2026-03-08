@@ -15,12 +15,6 @@ pub struct SkippedCursor<'a> {
     chunk_size: u32,
 }
 
-// pub struct SkippedCursor {
-//     arrow_schema_arc: Arc<Vec<u8>>,
-//     arrow_data: Vec<u8>,
-//     position: usize,
-// }
-
 impl<'a> SkippedCursor<'a> {
     pub fn new(arrow_schema_arc: Arc<Vec<u8>>, odps_arrow_data: &'a mut Bytes) -> Self {
         let chunk_size = odps_arrow_data.get_u32();
@@ -134,6 +128,45 @@ impl OdpsArrowReader {
         bytes: &'a mut Bytes,
     ) -> Result<StreamReader<SkippedCursor<'a>>, ArrowError> {
         let cursor = SkippedCursor::new(self.arrow_schema_bytes.clone(), bytes);
-        Ok(StreamReader::try_new(cursor, None)?)
+        StreamReader::try_new(cursor, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::{DataType, Field, Schema};
+    use super::*;
+    #[test]
+    fn test_read_from_bytes(){
+        let arrow_schema = Schema::new(vec![Field::new("name", DataType::Utf8, false), Field::new("age", DataType::Int64, false)]);
+        let mut schema_bytes = Vec::new();
+        // write the schema, set the written bytes to the schema
+        let data_gen = IpcDataGenerator::default();
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        let write_options = IpcWriteOptions::default();
+        let encoded_message = data_gen.schema_to_bytes_with_dictionary_tracker(
+            &arrow_schema,
+            &mut dictionary_tracker,
+            &write_options,
+        );
+
+        let (_aligned_size, _body_len) =
+            write_message(&mut schema_bytes, encoded_message, &write_options).unwrap();
+        let schema_bytes_arc = Arc::new(schema_bytes);
+        let python_data = b"\xff\xff\xff\xff\xc8\x00\x00\x00\x14\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x16\x00\x06\x00\x05\x00\x08\x00\x0c\x00\x0c\x00\x00\x00\x00\x03\x04\x00\x18\x00\x00\x00\x18\x00\x00\x00\x00\x00\x00\x00\x00\x00\n\x00\x18\x00\x0c\x00\x04\x00\x08\x00\n\x00\x00\x00l\x00\x00\x00\x10\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00lkj\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00";
+        let rust_data = b"\xff\xff\xff\xff\xc8\0\0\0\x10\0\0\0\x0c\0\x1a\0\x18\0\x17\0\x04\0\x08\0\x0c\0\0\0 \0\0\0(\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x03\x04\0\n\0\x18\0\x0c\0\x08\0\x04\0\n\0\0\0<\0\0\0\x10\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\x02\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x05\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\x08\0\0\0\0\0\0\0\x08\0\0\0\0\0\0\0\x10\0\0\0\0\0\0\0\x03\0\0\0\0\0\0\0\x18\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0 \0\0\0\0\0\0\0\x08\0\0\0\0\0\0\0\xff\0\0\0\0\0\0\0\0\0\0\0\x03\0\0\0lkj\0\0\0\0\0\xff\0\0\0\0\0\0\0\x04\0\0\0\0\0\0\0";
+        let mut bytes = Bytes::from_static(rust_data);
+        let cursor = SkippedCursor::new(schema_bytes_arc.clone(),  &mut bytes);
+        let reader = StreamReader::try_new(cursor, None).unwrap();
+        for batch in reader.into_iter(){
+            println!("rust: {:#?}", batch);
+        }
+
+        let mut bytes = Bytes::from_static(python_data);
+        let cursor = SkippedCursor::new(schema_bytes_arc.clone(),  &mut bytes);
+        let reader = StreamReader::try_new(cursor, None).unwrap();
+        for batch in reader.into_iter(){
+            println!("python: {:#?}", batch);
+        }
     }
 }
