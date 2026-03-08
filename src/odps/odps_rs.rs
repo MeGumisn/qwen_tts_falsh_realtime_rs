@@ -1,19 +1,21 @@
 use crate::common::errors::GenerationError;
 use crate::odps::account::SignRequest;
 use crate::odps::constants::insert_default_tunnel_header;
-use crate::odps::models::{TunnelDownloadSession, TunnelTableSchema, TunnelUploadSession};
+use crate::odps::models::{
+    TunnelDownloadSession, TunnelTableSchema, TunnelUploadSession, TunnelUploadedBlocks,
+};
 use crate::odps::odps_arrow_reader::OdpsArrowReader;
 use crate::odps::odps_arrow_writer::OdpsArrowWriter;
 use crate::odps::rest_client::RestClient;
 use arrow::array::RecordBatch;
 use arrow_schema::ArrowError;
+use bstr::ByteSlice;
 use bytes::Bytes;
 use futures_util::SinkExt;
 use log::{debug, info, warn};
 use reqwest::Method;
 use reqwest::header::HeaderMap;
 use std::sync::Arc;
-use bstr::ByteSlice;
 use tokio::sync::mpsc;
 
 struct Odps<'a, T>
@@ -227,7 +229,6 @@ where
         upload_id: &str,
         partition_spec: Option<&str>,
         block_id: Option<&str>,
-        tunnel_schema: &TunnelTableSchema,
         arrow_data: RecordBatch,
     ) -> Result<(), GenerationError> {
         let project_name: &str = project_name.unwrap_or(self.project_name);
@@ -281,6 +282,39 @@ where
         drop(odps_arrow_writer);
         request_task.await.expect("request_task failed");
         Ok(())
+    }
+
+    pub async fn commit_tunnel_upload_session(
+        &self,
+        project_name: Option<&str>,
+        table_name: &str,
+        upload_id: &str,
+        partition_spec: Option<&str>,
+    ) -> Result<TunnelUploadedBlocks, GenerationError> {
+        let project_name = project_name.unwrap_or(self.project_name);
+        let mut url_str = format!(
+            "{}/projects/{}/tables/{}?uploadid={}",
+            self.tunnel_endpoint, project_name, table_name, upload_id
+        );
+        if let Some(partition_spec) = partition_spec {
+            url_str.push_str("&partition=");
+            url_str.push_str(partition_spec);
+        }
+        let mut headers = HeaderMap::new();
+        insert_default_tunnel_header!(headers);
+        let response = self
+            .rest_client
+            .request(
+                url_str.as_str(),
+                Method::POST,
+                self.tunnel_endpoint.as_str(),
+                Some(headers),
+                None,
+            )
+            .await?;
+        let content = response.text().await?;
+        debug!("Upload session text: {:#?}", content);
+        Ok(serde_json::from_str::<TunnelUploadedBlocks>(&content)?)
     }
 }
 
@@ -394,10 +428,20 @@ mod tests {
             upload_session.upload_id.as_str(),
             None,
             Some("1"),
-            &upload_session.schema,
             record_batch,
         )
         .await
         .unwrap();
+        println!(
+            "{:#?}",
+            odps.commit_tunnel_upload_session(
+                None,
+                table_name,
+                upload_session.upload_id.as_str(),
+                None,
+            )
+            .await
+            .unwrap()
+        );
     }
 }

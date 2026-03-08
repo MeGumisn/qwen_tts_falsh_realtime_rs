@@ -100,3 +100,47 @@ pub struct TunnelUploadSession {
     #[serde(rename = "UploadID")]
     pub upload_id: String,
 }
+
+///
+/// 请求参数 POST /projects/test_dat_maxcompute/tables/json_string?uploadid=202603090330154dd9c20b26084017
+/// session.commit(block_id)后的返回结果
+/// ```json
+/// {
+///     "UploadedBlockList":
+///     [
+///         {
+///             "BlockID": 0,
+///             "CreateTime": 0,
+///             "Date": "",
+///             "FileName": "0_1772998216627_1",
+///             "RawSize": 0,
+///             "RecordCount": 1,
+///             "Version": 1772998216627
+///         }
+///     ]
+/// }
+///```
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TunnelUploadedBlocks {
+    #[serde(skip_serializing_if = "Option::is_none", rename = "UploadedBlockList")]
+    pub uploaded_block_list: Option<Vec<UploadedBlock>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadedBlock{
+    #[serde(rename = "BlockID")]
+    pub block_id: u32,
+    #[serde(rename = "CreateTime")]
+    pub create_time: u64,
+    #[serde(rename = "Date")]
+    pub date: String,
+    #[serde(rename = "FileName")]
+    pub file_name: String,
+    #[serde(rename = "RawSize")]
+    pub raw_size: i32,
+    #[serde(rename = "RecordCount")]
+    pub record_count: i32,
+    #[serde(rename = "Version")]
+    pub version: u64,
+
+}
