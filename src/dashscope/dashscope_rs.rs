@@ -3,12 +3,14 @@ use crate::common::{get_platform_info, get_processor_info};
 use crate::dashscope::parameters::{
     DashScopeRequestBodyBuilder, HistoryMessage, Message, Parameters,
 };
-use futures_util::StreamExt;
+use futures_util::{pin_mut, StreamExt};
+use log::{debug, info};
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Response};
 use rustc_version::version;
 use serde::de::Error;
 use serde_json::{Value, json};
+use crate::dashscope::models::response_data::DashScopeResponseData;
 
 pub struct Generation;
 
@@ -59,42 +61,58 @@ impl Generation {
             println!("{:#?}", res);
             println!("{:#?}", res.text().await);
         } else {
+            let status = &res.status();
+            let url = res.url().to_string();
+            if !status.is_success() {
+                return Err(GenerationError::DashScopeResponseError(format!(
+                    "请求失败, url: {}, reason: {}",
+                    url,
+                    res.text().await?
+                )));
+            }
             let mut stream = res.bytes_stream();
             let mut is_reasoning_answer = true;
             let separator = "=".repeat(20);
             print!("\n{}思考内容{}\n", separator, separator);
+            let mut usage = None;
             while let Some(item) = stream.next().await {
-                let chunk = item?;
-                let text = String::from_utf8_lossy(&chunk);
+                    let chunk = item?;
+                    debug!("chunk data: {:#?}", chunk);
+                    let text = String::from_utf8_lossy(&chunk);
 
-                // 逐行過濾包含 "data:" 的內容
-                for line in text.lines() {
-                    if line.starts_with("data:") {
-                        let json_str = line.strip_prefix("data:").unwrap().trim(); // 去掉 "data:" 並修剪空格
-                        // 解析為 JSON Map
-                        let json_map: Value = serde_json::from_str(json_str)?;
-                        // 提取你需要的字段，例如推理內容
-                        if is_reasoning_answer
-                            && let Some(content) =
-                                json_map["output"]["choices"][0]["message"]["reasoning_content"]
-                                    .as_str()
-                            && !content.is_empty()
-                        {
-                            print!("{}", content); // 實現逐字輸出效果
-                        }
-
-                        if let Some(content) =
-                            json_map["output"]["choices"][0]["message"]["content"].as_str()
-                            && !content.is_empty()
-                        {
-                            if is_reasoning_answer {
-                                is_reasoning_answer = false;
-                                print!("\n{}回复内容{}\n", separator, separator);
+                    // 逐行過濾包含 "data:" 的內容
+                    for line in text.lines() {
+                        if line.starts_with("data:") {
+                            let json_str = line.strip_prefix("data:").unwrap().trim(); // 去掉 "data:" 並修剪空格
+                            // 解析為 JSON Map
+                            let response_data =
+                                serde_json::from_str::<DashScopeResponseData>(json_str)?;
+                            let choice = &response_data.output.choices[0];
+                            let message = &choice.message;
+                            // 提取你需要的字段，例如推理內容
+                            if is_reasoning_answer && !&message.content.is_empty() {
+                                print!("{}", message.content); // 實現逐字輸出效果
                             }
-                            print!("{}", content);
+
+                            if let Some(content) = &message.reasoning_content
+                                && !content.is_empty()
+                            {
+                                if is_reasoning_answer {
+                                    is_reasoning_answer = false;
+                                    print!("\n{}回复内容{}\n", separator, separator);
+                                }
+                                print!("{}", content);
+                            }
+                            if choice.finish_reason!="null" {
+                                debug!("获取 token usage 信息");
+                                usage = Some(response_data.usage);
+                            }
                         }
                     }
                 }
+            if let Some(usage) = usage {
+                print!("\n{}Token消耗{}\n", separator, separator);
+                print!("{:?}", usage)
             }
         }
         Ok(())
@@ -179,10 +197,12 @@ impl Generation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::logging::init_logger;
     use serde_json::{from_value, json};
 
     #[tokio::test]
     async fn test_generation() -> Result<(), GenerationError> {
+        init_logger("debug");
         let model = "deepseek-r1";
         let stream = true;
         let messages = vec![Message::new("user".to_string(), "你是谁?".to_string())];

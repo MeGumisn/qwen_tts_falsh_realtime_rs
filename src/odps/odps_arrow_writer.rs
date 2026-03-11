@@ -7,11 +7,10 @@ use arrow::ipc::writer::{
 use arrow_schema::ArrowError;
 use bstr::ByteSlice;
 use log::{debug, info};
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::hash::Hasher;
 use std::io::{Cursor, Write};
 use tokio::sync::mpsc;
-
 
 ///
 /// ## 用于生成可以通过服务端校验的arrow data
@@ -24,6 +23,7 @@ use tokio::sync::mpsc;
 /// - chunk_crc: chunk的校验码, 需要使用 CRC32C (Castagnoli)计算, 4字节, 大端序
 struct TrackedWriter {
     inner: Cursor<Vec<u8>>,
+    buffer_size: usize,
     chunk_size: u32,
     position: u64,
     // 用于计算单个record_batch的checksum
@@ -38,6 +38,7 @@ impl TrackedWriter {
     fn new(writer: Cursor<Vec<u8>>, chunk_size: u32, tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
         Self {
             inner: writer,
+            buffer_size: 256 * 1024,
             chunk_size,
             position: 0,
             crc: crc32c::Crc32cHasher::new(0),
@@ -55,29 +56,36 @@ impl TrackedWriter {
         Ok(crc_len)
     }
 
+    ///
+    /// chunk 65536已经写满，重置crc并写入新chunk
+    /// buffer 256*1024已经写满，需要发送到服务端
     fn take_chunk_data(&mut self, finished: bool) -> std::io::Result<()> {
-        debug!("arrow data: {:#?}", self.inner.get_ref().as_bstr());
         if finished {
             self.write_finish_tags()?;
         } else {
             let checksum = self.crc.finish() as u32;
             self.inner.write_all(&checksum.to_be_bytes())?;
+            debug!("write chunk checksum: {} completed, current position:{}, reset crc", checksum, self.inner.position());
             self.crc = crc32c::Crc32cHasher::new(0);
         }
-        // 这里将cursor中的内容置换出来
-        let data = self.inner.get_mut();
-        let data_to_send = std::mem::take(data);
-
-        info!("try send chunk data");
-        // 在同步環境中強行阻塞等待異步結果
-        // 如果外部接收端關閉，這裡會報錯
-        if let Err(e) = self.tx.send(data_to_send) {
-            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e));
+        // 当buffer已满，发送数据到服务端
+        if finished || self.inner.position() >= self.buffer_size as u64 {
+            info!("buffer is full or write finished");
+            // 这里将cursor中的内容置换出来
+            let data = self.inner.get_mut();
+            let data_to_send = std::mem::take(data);
+            info!("try send buffer data");
+            // 在同步環境中強行阻塞等待異步結果
+            // 如果外部接收端關閉，這裡會報錯
+            if let Err(e) = self.tx.send(data_to_send) {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e));
+            }
+            self.inner.set_position(0);
         }
-        self.inner.set_position(0);
         self.position = 0;
-        if !finished {
-            info!("write operation not finish, write chunk size and continue");
+        if finished {
+            info!("write operation finished, write chunk size and continue");
+            self.inner.set_position(0);
             // 在头部重新写入chunk size信息
             self.inner
                 .write_all(self.chunk_size.to_be_bytes().as_ref())?;
@@ -92,35 +100,38 @@ impl Write for TrackedWriter {
         while bytes_written < buf.len() {
             // 1.计算可用空间
             let rest_capacity = self.chunk_size as usize - self.position as usize;
+            // 预留4位给crc
+            let rest_buffer_capacity = self.buffer_size-self.inner.position() as usize - 4;
             let write_len = min(rest_capacity, buf.len() - bytes_written);
+            let write_len = min(write_len, rest_buffer_capacity);
             //
             let n = self
                 .inner
                 .write(&buf[bytes_written..bytes_written + write_len])?;
             info!("write data to buf, data length: {}", n);
             self.crc.write(&buf[bytes_written..bytes_written + n]);
+            debug!("update crc checksum");
             let cur_crc_checksum = self.crc.finish() as u32;
             self.crc = crc32c::Crc32cHasher::new(cur_crc_checksum);
+            debug!("update crc all checksum");
             self.crc_all.write(&buf[bytes_written..bytes_written + n]);
             let cur_crc_all_checksum = self.crc_all.finish() as u32;
             self.crc_all = crc32c::Crc32cHasher::new(cur_crc_all_checksum);
-            debug!(
-                "当前buf: {:?}, 当前crc: {:#?}, crc_all: {:#?}",
-                buf.as_bstr(),
-                cur_crc_checksum,
-                cur_crc_all_checksum
-            );
+
             self.position += n as u64;
+            let inner_position = self.inner.position();
             // 发现chunk写满了
-            if self.position >= self.chunk_size as u64 {
-                info!("chunk size limit exceeded, try refresh");
+            if self.position >= self.chunk_size as u64 || inner_position >= (self.buffer_size as u64 - 4) {
+                debug!(
+                    "当前buffer pos: {}, 当前crc: {:#?}, crc_all: {:#?}",
+                    inner_position,
+                    cur_crc_checksum,
+                    cur_crc_all_checksum
+                );
+                info!("chunk size limit exceeded, try write checksum");
                 self.take_chunk_data(false)?;
-                info!("reset position");
-                self.inner.set_position(0);
+                // 重置当前pos, 准备写入下个chunk的数据
                 self.position = 0;
-                // 在头部重新写入chunk size信息
-                self.inner
-                    .write_all(self.chunk_size.to_be_bytes().as_ref())?;
             }
             bytes_written += n;
         }
@@ -146,8 +157,8 @@ impl OdpsArrowWriter {
         tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<Self, ArrowError> {
         // 这里要给前后各留4个字节
-        let buffer = Vec::with_capacity(chunk_size as usize + 8);
-        let mut cursor = Cursor::new(buffer);
+        let chunk_buffer = Vec::with_capacity(256 * 1024);
+        let mut cursor = Cursor::new(chunk_buffer);
         cursor.write_all(chunk_size.to_be_bytes().as_ref())?;
         let tracked_writer = TrackedWriter::new(cursor, chunk_size, tx);
         // 开头4个字节固定是chunk_size, 结尾4个字节固定是crc

@@ -5,6 +5,9 @@ use tokio_tungstenite::tungstenite::http;
 
 #[derive(Debug, Error)]
 pub enum GenerationError {
+    #[error("dash scope 服务端返回异常: {0}")]
+    DashScopeResponseError(String),
+
     #[error("网络错误: {0}")]
     ReqwestError(#[from] reqwest::Error),
 

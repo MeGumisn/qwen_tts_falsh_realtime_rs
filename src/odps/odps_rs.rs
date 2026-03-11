@@ -12,9 +12,12 @@ use arrow_schema::ArrowError;
 use bstr::ByteSlice;
 use bytes::Bytes;
 use futures_util::SinkExt;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use reqwest::Method;
 use reqwest::header::HeaderMap;
+use std::cmp::{max, min};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -220,6 +223,26 @@ where
         Ok(upload_session)
     }
 
+    #[cfg(test)]
+    fn unescape_python_bstr(s: &str) -> Vec<u8> {
+        // 移除開頭的 b' 和結尾的 '
+        let inner = s.strip_prefix("b'").and_then(|s| s.strip_suffix("'")).unwrap_or(s);
+
+        let mut bytes = Vec::new();
+        let mut chars = inner.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\\' && chars.peek() == Some(&'x') {
+                chars.next(); // 跳過 'x'
+                let hex: String = chars.by_ref().take(2).collect();
+                bytes.push(u8::from_str_radix(&hex, 16).unwrap());
+            } else {
+                bytes.push(c as u8);
+            }
+        }
+        bytes
+    }
+
     ///
     /// PUT /projects/test_dat_maxcompute/tables/json_string?uploadid=2026030710275181dd321a20f6b624&arrow=&blockid=0
     pub async fn open_tunnel_arrow_writer(
@@ -243,6 +266,7 @@ where
         }
         let mut headers = HeaderMap::new();
         insert_default_tunnel_header!(headers);
+
         headers.insert("Transfer-Encoding", "chunked".parse()?);
         headers.insert("Content-Type", "application/octet-stream".parse()?);
 
@@ -252,9 +276,38 @@ where
         let rest_client = self.rest_client.clone();
         let headers_owned = headers.clone();
         let tunnel_endpoint_clone = self.tunnel_endpoint.clone();
+
         let request_task = tokio::spawn(async move {
-            while let Some(data) = rx.recv().await {
-                info!("收到寫滿的 chunk，準備發送...\n{:#?}", data.as_bstr());
+            // TODO 这里chunked数据需要包装为 "%x\r\n%b\r\n"
+            let chunked = true;
+            while let Some(payload) = rx.recv().await {
+                let mut payload = Vec::new();
+                let _ = File::open("./chunk").unwrap().read_to_end(&mut payload);
+                let _ = File::create("./chunk.txt").unwrap().write(payload.as_bstr()).unwrap();
+                let payload_len = payload.len();
+                info!(
+                    "收到寫滿的 buffer，chunk encoding length {:X}, 準備發送...\n",
+                    payload_len
+                );
+                let data_send = if chunked {
+                    // 2. 構造 Chunked 格式: "{hex_len}\r\n{payload}\r\n"
+                    let mut chunked_data = Vec::with_capacity(payload_len); // 預留空間給 Header/Footer
+
+                    // 寫入 16 進位長度和 CRLF
+                    use std::io::Write;
+                    write!(chunked_data, "{:X}\r\n", payload_len).unwrap();
+
+                    // 寫入原始數據
+                    chunked_data.extend_from_slice(&payload);
+
+                    // 寫入結尾的 CRLF
+                    chunked_data.extend_from_slice(b"\r\n");
+                    chunked_data
+                } else {
+                    payload
+                };
+
+
                 // 這裡可以安全地使用 .await，不會阻塞寫入線程
                 if let Ok(response) = rest_client
                     .request(
@@ -262,13 +315,30 @@ where
                         Method::PUT,
                         &tunnel_endpoint_clone,
                         Some(headers_owned.clone()),
-                        Some(data),
+                        Some(data_send),
                     )
                     .await
                 {
+                    let put_success = response.status().is_success();
                     match response.text().await {
-                        Ok(content) => info!("send data success: {:?}", content),
-                        Err(e) => warn!("send data failed: {:?}", e),
+                        Ok(content) => {
+                            if put_success {
+                                info!(
+                                    "send data finished, response status is success: {:?}",
+                                    content
+                                )
+                            } else {
+                                error!(
+                                    "send data finished, response status is failed: {:?}",
+                                    content
+                                );
+                                panic!();
+                            }
+                        }
+                        Err(e) => {
+                            error!("send data failed: {:?}", e);
+                            panic!();
+                        }
                     }
                 }
             }
@@ -324,6 +394,8 @@ mod tests {
     use crate::odps::account::test_account;
     use arrow::array::record_batch;
     use log::info;
+    use std::fs::File;
+    use std::io::Read;
 
     #[tokio::test]
     async fn test_get_tunnel_host() {
@@ -420,7 +492,13 @@ mod tests {
             .await
             .unwrap();
 
-        let record_batch = record_batch!(("name", Utf8, ["lkj"]), ("age", Int64, [4])).unwrap();
+        let mut name = String::new();
+        let name_len = File::open("./name.txt")
+            .unwrap()
+            .read_to_string(&mut name)
+            .unwrap();
+        println!("name length: {}", name_len);
+        let record_batch = record_batch!(("name", Utf8, [name]), ("age", Int64, [4])).unwrap();
 
         odps.open_tunnel_arrow_writer(
             None,
