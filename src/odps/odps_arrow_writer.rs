@@ -59,10 +59,11 @@ impl TrackedWriter {
     ///
     /// chunk 65536已经写满，重置crc并写入新chunk
     /// buffer 256*1024已经写满，需要发送到服务端
-    fn take_chunk_data(&mut self, finished: bool) -> std::io::Result<()> {
+    fn take_chunk_data(&mut self, finished: bool, chunk_finished:bool) -> std::io::Result<()> {
         if finished {
             self.write_finish_tags()?;
-        } else {
+        } else if chunk_finished {
+            // 只有当chunk写满之后才添加crc
             let checksum = self.crc.finish() as u32;
             self.inner.write_all(&checksum.to_be_bytes())?;
             debug!("write chunk checksum: {} completed, current position:{}, reset crc", checksum, self.inner.position());
@@ -101,7 +102,7 @@ impl Write for TrackedWriter {
             // 1.计算可用空间
             let rest_capacity = self.chunk_size as usize - self.position as usize;
             // 预留4位给crc
-            let rest_buffer_capacity = self.buffer_size-self.inner.position() as usize - 4;
+            let rest_buffer_capacity = self.buffer_size - self.inner.position() as usize;
             let write_len = min(rest_capacity, buf.len() - bytes_written);
             let write_len = min(write_len, rest_buffer_capacity);
             //
@@ -119,18 +120,23 @@ impl Write for TrackedWriter {
             self.crc_all = crc32c::Crc32cHasher::new(cur_crc_all_checksum);
 
             self.position += n as u64;
-            let inner_position = self.inner.position();
             // 发现chunk写满了
-            if self.position >= self.chunk_size as u64 || inner_position >= (self.buffer_size as u64 - 4) {
+            if self.position >= self.chunk_size as u64 {
                 debug!(
-                    "当前buffer pos: {}, 当前crc: {:#?}, crc_all: {:#?}",
-                    inner_position,
+                    "当前chunk pos: {}, 当前crc: {:#?}, crc_all: {:#?}",
+                    self.position,
                     cur_crc_checksum,
                     cur_crc_all_checksum
                 );
                 info!("chunk size limit exceeded, try write checksum");
-                self.take_chunk_data(false)?;
+                self.take_chunk_data(false, true)?;
                 // 重置当前pos, 准备写入下个chunk的数据
+                self.position = 0;
+            }
+            let inner_position = self.inner.position();
+            if inner_position >= self.buffer_size  as u64 {
+                info!("buffer size limit exceeded, try send data");
+                self.take_chunk_data(false, false)?;
                 self.position = 0;
             }
             bytes_written += n;
@@ -175,7 +181,7 @@ impl OdpsArrowWriter {
 
     pub async fn write_record(
         &mut self,
-        record_batch_iter: impl Iterator<Item = RecordBatch>,
+        record_batch_iter: impl Iterator<Item=RecordBatch>,
     ) -> Result<bool, ArrowError> {
         let mut dictionary_tracker = DictionaryTracker::new(false);
         let write_option = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?;
@@ -200,13 +206,15 @@ impl OdpsArrowWriter {
     }
 
     pub fn close(&mut self) -> Result<(), ArrowError> {
-        self.tracked_writer.take_chunk_data(true)?;
+        self.tracked_writer.take_chunk_data(true, false)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Read;
     use super::*;
     use crc32c::Crc32cHasher;
     #[test]
@@ -229,5 +237,25 @@ mod tests {
         // let crc2 = crc2.finish() as u32;
         // // 去掉4个\xff是 1668077719
         println!("{}, {}, {}, {}", a, b, c, d);
+    }
+
+    #[test]
+    fn test_crc_py() {
+        let mut payload = Vec::new();
+        let _ = File::open("./payload").unwrap().read_to_end(&mut payload);
+        // 开头4位固定 65536， 4字节
+        // 末尾4位 crc校验值
+        let chunk_size = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+        let len = payload.len();
+
+        let data_start = min(65540*2+4, len - 4);
+        // data_end = crc_start
+        let data_end = min(65540*3, len - 4);
+        let crc_end = data_end+4;
+
+        let crc_data = u32::from_be_bytes(payload[data_end..crc_end].try_into().unwrap());
+
+        let calculated_crc = crc32c::crc32c(&payload[data_start..data_end]);
+        println!("vec size: {}, chunk size: {}, crc data: {}, calculated crc data: {}", payload.len(), chunk_size, crc_data, calculated_crc);
     }
 }

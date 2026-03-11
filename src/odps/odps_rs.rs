@@ -281,9 +281,12 @@ where
             // TODO 这里chunked数据需要包装为 "%x\r\n%b\r\n"
             let chunked = true;
             while let Some(payload) = rx.recv().await {
-                let mut payload = Vec::new();
-                let _ = File::open("./chunk").unwrap().read_to_end(&mut payload);
-                let _ = File::create("./chunk.txt").unwrap().write(payload.as_bstr()).unwrap();
+                #[cfg(test)]
+                let _ = File::create("./payload").unwrap().write(&payload).unwrap();
+                //     let mut payload = Vec::new();
+                //     let _ = File::open("./chunk").unwrap().read_to_end(&mut payload);
+                //     let _ = File::create("./chunk.txt").unwrap().write(payload.as_bstr()).unwrap();
+                // }
                 let payload_len = payload.len();
                 info!(
                     "收到寫滿的 buffer，chunk encoding length {:X}, 準備發送...\n",
