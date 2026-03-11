@@ -37,6 +37,11 @@ bstr = "1.12.1"
 regex = "1.12.2"
 url = "2.5.8"
 lazy_static = "1.5.0"
+tokio-util = "0.7.18"
+tokio-stream = "0.1.18"
+
+# 用于查看详细日志
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-version = "0.1"

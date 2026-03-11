@@ -5,3 +5,4 @@ pub mod account;
 pub mod odps_arrow_reader;
 pub mod constants;
 mod odps_arrow_writer;
+mod async_odps_arrow_writer;

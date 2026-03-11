@@ -1,15 +1,16 @@
-use crate::odps::models::TunnelTableSchema;
 use arrow::array::RecordBatch;
 use arrow::ipc::MetadataVersion;
 use arrow::ipc::writer::{
     CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
 };
 use arrow_schema::ArrowError;
-use bstr::ByteSlice;
 use log::{debug, info};
 use std::cmp::{max, min};
 use std::hash::Hasher;
 use std::io::{Cursor, Write};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncWrite};
 use tokio::sync::mpsc;
 
 ///
@@ -35,10 +36,11 @@ struct TrackedWriter {
 }
 
 impl TrackedWriter {
+    const BUFFER_SIZE: usize = 4;
     fn new(writer: Cursor<Vec<u8>>, chunk_size: u32, tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
         Self {
             inner: writer,
-            buffer_size: 256 * 1024,
+            buffer_size: Self::BUFFER_SIZE,
             chunk_size,
             position: 0,
             crc: crc32c::Crc32cHasher::new(0),
@@ -150,6 +152,24 @@ impl Write for TrackedWriter {
     }
 }
 
+impl AsyncWrite for TrackedWriter {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        // 因為 inner 是 Cursor (內存操作)，所以永遠不會回傳 Pending
+        let n = self.write(buf)?;
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(self.inner.flush())
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // 這裡觸發最後的 finish 標籤
+        self.take_chunk_data(true, false)?;
+        Poll::Ready(Ok(()))
+    }
+}
+
 pub struct OdpsArrowWriter {
     chunk_size: u32,
     tracked_writer: TrackedWriter,
@@ -163,7 +183,7 @@ impl OdpsArrowWriter {
         tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<Self, ArrowError> {
         // 这里要给前后各留4个字节
-        let chunk_buffer = Vec::with_capacity(256 * 1024);
+        let chunk_buffer = Vec::with_capacity(TrackedWriter::BUFFER_SIZE);
         let mut cursor = Cursor::new(chunk_buffer);
         cursor.write_all(chunk_size.to_be_bytes().as_ref())?;
         let tracked_writer = TrackedWriter::new(cursor, chunk_size, tx);

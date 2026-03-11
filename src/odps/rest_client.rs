@@ -1,8 +1,9 @@
 use crate::common::errors::GenerationError;
 use crate::odps::account::SignRequest;
 use regex::Regex;
-use reqwest::{Client, Method, Response, Url};
+use reqwest::{Body, Client, ClientBuilder, Method, Proxy, Response, Url, Version};
 use std::str::FromStr;
+use futures_util::Stream;
 use tokio_tungstenite::tungstenite::http::HeaderMap;
 
 
@@ -19,9 +20,14 @@ where
     T: SignRequest,
 {
     pub fn new(account: T) -> Self {
+
+        let client = Client::builder()
+            // .proxy(Proxy::all("http://127.0.0.1:8080").unwrap())
+            // .danger_accept_invalid_certs(true)
+            .build().unwrap();
         Self {
             account,
-            client: Client::new(),
+            client: client,
         }
     }
 
@@ -35,7 +41,7 @@ where
         method: Method,
         endpoint: &'a str,
         header_map: Option<HeaderMap>,
-        body: Option<Vec<u8>>,
+        body: Option<Body>,
     ) -> Result<Response, GenerationError> {
         let mut request_builder = self
             .client

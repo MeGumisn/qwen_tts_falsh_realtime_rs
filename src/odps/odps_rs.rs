@@ -13,13 +13,17 @@ use bstr::ByteSlice;
 use bytes::Bytes;
 use futures_util::SinkExt;
 use log::{debug, error, info, warn};
-use reqwest::Method;
 use reqwest::header::HeaderMap;
+use reqwest::{Body, Method};
 use std::cmp::{max, min};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use tokio::io;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::task::futures;
+use tokio_util::io::ReaderStream;
 
 struct Odps<'a, T>
 where
@@ -226,7 +230,10 @@ where
     #[cfg(test)]
     fn unescape_python_bstr(s: &str) -> Vec<u8> {
         // 移除開頭的 b' 和結尾的 '
-        let inner = s.strip_prefix("b'").and_then(|s| s.strip_suffix("'")).unwrap_or(s);
+        let inner = s
+            .strip_prefix("b'")
+            .and_then(|s| s.strip_suffix("'"))
+            .unwrap_or(s);
 
         let mut bytes = Vec::new();
         let mut chars = inner.chars().peekable();
@@ -267,85 +274,72 @@ where
         let mut headers = HeaderMap::new();
         insert_default_tunnel_header!(headers);
 
+        headers.remove("Content-Length");
         headers.insert("Transfer-Encoding", "chunked".parse()?);
         headers.insert("Content-Type", "application/octet-stream".parse()?);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        // 3. 異步處理器：負責發送請求
-        let url_clone = url_str.clone();
+        let (chunk_writer, chunk_reader) = io::duplex(4);
+
         let rest_client = self.rest_client.clone();
-        let headers_owned = headers.clone();
-        let tunnel_endpoint_clone = self.tunnel_endpoint.clone();
+        let url_str_clone = url_str.clone();
+        let tunnel_endpoint = self.tunnel_endpoint.clone();
+
+        let chunk_writer_task = tokio::spawn(async move {
+            // TODO 这里chunked数据需要包装为 "%x\r\n%b\r\n"
+            let mut writer = chunk_writer;
+            while let Some(payload) = rx.recv().await {
+                // debug!("Chunk received: {:#?}", payload);
+                if let Err(e) = writer.write_all(&payload).await {
+                    break;
+                }
+            }
+            info!("write data finished");
+            let _ = writer.flush().await;
+        });
 
         let request_task = tokio::spawn(async move {
-            // TODO 这里chunked数据需要包装为 "%x\r\n%b\r\n"
-            let chunked = true;
-            while let Some(payload) = rx.recv().await {
-                #[cfg(test)]
-                let _ = File::create("./payload").unwrap().write(&payload).unwrap();
-                //     let mut payload = Vec::new();
-                //     let _ = File::open("./chunk").unwrap().read_to_end(&mut payload);
-                //     let _ = File::create("./chunk.txt").unwrap().write(payload.as_bstr()).unwrap();
-                // }
-                let payload_len = payload.len();
-                info!(
-                    "收到寫滿的 buffer，chunk encoding length {:X}, 準備發送...\n",
-                    payload_len
-                );
-                let data_send = if chunked {
-                    // 2. 構造 Chunked 格式: "{hex_len}\r\n{payload}\r\n"
-                    let mut chunked_data = Vec::with_capacity(payload_len); // 預留空間給 Header/Footer
-
-                    // 寫入 16 進位長度和 CRLF
-                    use std::io::Write;
-                    write!(chunked_data, "{:X}\r\n", payload_len).unwrap();
-
-                    // 寫入原始數據
-                    chunked_data.extend_from_slice(&payload);
-
-                    // 寫入結尾的 CRLF
-                    chunked_data.extend_from_slice(b"\r\n");
-                    chunked_data
-                } else {
-                    payload
-                };
-
-
-                // 這裡可以安全地使用 .await，不會阻塞寫入線程
-                if let Ok(response) = rest_client
-                    .request(
-                        &url_clone,
-                        Method::PUT,
-                        &tunnel_endpoint_clone,
-                        Some(headers_owned.clone()),
-                        Some(data_send),
-                    )
-                    .await
-                {
-                    let put_success = response.status().is_success();
-                    match response.text().await {
-                        Ok(content) => {
-                            if put_success {
-                                info!(
-                                    "send data finished, response status is success: {:?}",
-                                    content
-                                )
-                            } else {
-                                error!(
-                                    "send data finished, response status is failed: {:?}",
-                                    content
-                                );
-                                panic!();
-                            }
-                        }
-                        Err(e) => {
-                            error!("send data failed: {:?}", e);
+            let stream = ReaderStream::new(chunk_reader);
+            let body = Body::wrap_stream(stream);
+            // 3. 異步處理器：負責發送請求
+            // 這裡可以安全地使用 .await，不會阻塞寫入線程
+            debug!("request started");
+            if let Ok(response) = rest_client
+                .request(
+                    url_str_clone.as_str(),
+                    Method::PUT,
+                    &tunnel_endpoint,
+                    Some(headers),
+                    Some(body),
+                )
+                .await
+            {
+                debug!("request finished, check response: {:#?}", response);
+                let put_success = response.status().is_success();
+                match response.text().await {
+                    Ok(content) => {
+                        if put_success {
+                            info!(
+                                "send data finished, response status is success: {:?}",
+                                content
+                            )
+                        } else {
+                            error!(
+                                "send data finished, response status is failed: {:?}",
+                                content
+                            );
                             panic!();
                         }
+                    }
+                    Err(e) => {
+                        error!("send data failed: {:?}", e);
+                        panic!();
                     }
                 }
             }
         });
+
+
 
         let mut odps_arrow_writer = OdpsArrowWriter::new(65536, tx).await?;
         odps_arrow_writer
@@ -353,7 +347,11 @@ where
             .await?;
         odps_arrow_writer.close()?;
         drop(odps_arrow_writer);
+
         request_task.await.expect("request_task failed");
+        chunk_writer_task.await.expect("request_task failed");
+
+
         Ok(())
     }
 
@@ -481,6 +479,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_tunnel_arrow_writer() {
+        // 初始化env_logger以查看日志
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
         let account = test_account();
         let project_name = "test_dat_maxcompute";
         let table_name = "json_string";
@@ -501,7 +503,11 @@ mod tests {
             .read_to_string(&mut name)
             .unwrap();
         println!("name length: {}", name_len);
-        let record_batch = record_batch!(("name", Utf8, [name]), ("age", Int64, [4])).unwrap();
+        let record_batch = record_batch!(
+            ("name", Utf8, [name[0..16].to_string()]),
+            ("age", Int64, [4])
+        )
+        .unwrap();
 
         odps.open_tunnel_arrow_writer(
             None,

@@ -221,8 +221,8 @@ impl SignRequest for AliyunAccount<'_> {
 
 #[cfg(test)]
 pub fn test_account<'a>() -> AliyunAccount<'a> {
-    use crate::common::logging::init_logger;
-    init_logger("debug");
+    // use crate::common::logging::init_logger;
+    // init_logger("debug");
     AliyunAccount::new(env!("ACCESS_ID"), env!("SECRET_KEY"))
 }
 
