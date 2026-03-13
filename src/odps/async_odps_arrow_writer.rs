@@ -1,108 +1,124 @@
-// use std::hash::Hasher;
-// use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
-// use std::pin::Pin;
-// use std::task::{Context, Poll};
-// use std::io::{Cursor, Write};
-// use std::cmp::min;
-// use tokio::sync::mpsc;
-//
-// struct TrackedWriter {
-//     inner: Cursor<Vec<u8>>,
-//     buffer_size: usize,
-//     chunk_size: u32,
-//     position: u64,
-//     crc: crc32c::Crc32cHasher,
-//     crc_all: crc32c::Crc32cHasher,
-//     tx: mpsc::UnboundedSender<Vec<u8>>,
-//     // 這裡我們不再需要單獨的 chunk_writer，
-//     // 因為 TrackedWriter 本身就是一個 AsyncWrite，可以直接對接給 Reqwest
-// }
-//
-// impl AsyncWrite for TrackedWriter {
-//     fn poll_write(
-//         mut self: Pin<&mut Self>,
-//         cx: &mut Context<'_>,
-//         buf: &[u8],
-//     ) -> Poll<std::io::Result<usize>> {
-//         // 因為 AsyncWrite 要求非阻塞，但你的 CRC 和 Cursor 操作是同步的（CPU bound）
-//         // 我們可以直接在 poll_write 中執行這些邏輯
-//
-//         let mut bytes_written = 0;
-//         let buf_len = buf.len();
-//
-//         while bytes_written < buf_len {
-//             // 1. 計算剩餘空間
-//             let rest_capacity = self.chunk_size as u64 - self.position;
-//             let current_pos = self.inner.position();
-//             let rest_buffer_capacity = self.buffer_size as u64 - current_pos;
-//
-//             let write_len = min(rest_capacity, (buf_len - bytes_written) as u64);
-//             let write_len = min(write_len, rest_buffer_capacity) as usize;
-//
-//             if write_len == 0 {
-//                 // 如果緩衝區滿了，我們需要先觸發發送
-//                 // 注意：這裡的 take_chunk_data 必須是同步的或者是能立即完成的
-//                 // 如果發送過程涉及 await，建議在 poll_write 外部處理
-//                 if let Err(e) = self.as_mut().sync_take_chunk(false, false) {
-//                     return Poll::Ready(Err(e));
-//                 }
-//                 continue;
-//             }
-//
-//             // 2. 寫入數據與更新 CRC (同步操作)
-//             let slice = &buf[bytes_written..bytes_written + write_len];
-//             std::io::Write::write_all(&mut self.inner, slice)?;
-//
-//             let _ = self.crc.write(slice);
-//             self.crc_all.write(slice);
-//
-//             self.position += write_len as u64;
-//             bytes_written += write_len;
-//
-//             // 3. 檢查是否達到 Chunk 或 Buffer 上限
-//             if self.position >= self.chunk_size as u64 {
-//                 self.as_mut().sync_take_chunk(false, true)?;
-//                 self.position = 0;
-//             } else if self.inner.position() >= self.buffer_size as u64 {
-//                 self.as_mut().sync_take_chunk(false, false)?;
-//                 // 這裡不重置 position，因為 chunk 還沒完
-//             }
-//         }
-//
-//         Poll::Ready(Ok(bytes_written))
-//     }
-//
-//     fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-//         Poll::Ready(std::io::Write::flush(&mut self.inner))
-//     }
-//
-//     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-//         Poll::Ready(Ok(()))
-//     }
-// }
-//
-// impl TrackedWriter {
-//     // 將原本異步的發送邏輯簡化。如果是 UnboundedSender，send 是同步的。
-//     fn sync_take_chunk(&mut self, finished: bool, is_chunk_end: bool) -> std::io::Result<()> {
-//         let data = self.inner.get_mut();
-//         let payload = std::mem::take(data);
-//
-//         if !payload.is_empty() {
-//             // 這裡直接封裝成 Chunked 格式發送給 tx
-//             // 讓接收端直接寫入 reqwest 的 duplex stream
-//             // let mut chunk = Vec::with_capacity(payload.len() + 16);
-//             // write!(&mut chunk, "{:X}\r\n", payload.len())?;
-//             // chunk.extend_from_slice(&payload);
-//             // chunk.extend_from_slice(b"\r\n");
-//
-//             self.tx.send(payload).map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "channel closed"))?;
-//         }
-//
-//         // if finished {
-//         //     self.tx.send(b"0\r\n\r\n".to_vec()).ok();
-//         // }
-//
-//         self.inner.set_position(0);
-//         Ok(())
-//     }
-// }
+use arrow::array::RecordBatch;
+use arrow::ipc::MetadataVersion;
+use arrow::ipc::writer::{
+    CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+};
+use arrow_schema::ArrowError;
+use crc32c::Crc32cHasher;
+use futures_util::SinkExt;
+use log::debug;
+use std::cmp::min;
+use std::hash::Hasher;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+pub struct AsyncOdpsArrowWriter<W: AsyncWrite + Unpin> {
+    chunk_size: usize,
+    chunk_writer: W,
+    generator: IpcDataGenerator,
+    cur_chunk_pos: usize,
+    crc: Crc32cHasher,
+    global_crc: Crc32cHasher,
+}
+
+impl<W> AsyncOdpsArrowWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    pub async fn new(chunk_size: usize, mut chunk_writer: W) -> Result<Self, ArrowError> {
+        let _ = &mut chunk_writer.write_u32(chunk_size as u32).await?;
+        let generator = IpcDataGenerator::default();
+        let crc = Crc32cHasher::new(0);
+        let global_crc = Crc32cHasher::new(0);
+        // 2. 每次寫入 Batch 時
+        Ok(Self {
+            chunk_size,
+            chunk_writer,
+            generator,
+            cur_chunk_pos: 0,
+            crc,
+            global_crc,
+        })
+    }
+
+    pub async fn write_record(
+        &mut self,
+        record_batch_iter: impl Iterator<Item = RecordBatch>,
+    ) -> Result<bool, ArrowError> {
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        let write_option = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?;
+        let mut compression_context = CompressionContext::default();
+        for record_batch in record_batch_iter {
+            if let Ok((_encoded_message, encoded_data)) = self.generator.encode(
+                &record_batch,
+                &mut dictionary_tracker,
+                &write_option,
+                &mut compression_context,
+            ) {
+                //  单个batch起始位以0xff开头
+                self.write_chunk_data(&[0xff, 0xff, 0xff, 0xff]).await?;
+                // 2. 獲取長度
+                let header_size = encoded_data.ipc_message.len() as u32;
+                self.write_chunk_data(&header_size.to_le_bytes()).await?;
+                self.write_chunk_data(&encoded_data.ipc_message).await?;
+                self.write_chunk_data(&encoded_data.arrow_data).await?;
+            }
+        }
+        // 完成后写入global crc校验码
+        Ok(true)
+    }
+
+    pub async fn write_chunk_data(&mut self, buf: &[u8]) -> Result<(), ArrowError> {
+        let mut bytes_written = 0;
+        debug!("buf len: {}", buf.len());
+        while bytes_written < buf.len() {
+            let rest_buf_len = buf.len() - bytes_written;
+            let rest_chunk_size = self.chunk_size - self.cur_chunk_pos;
+            let len = min(rest_buf_len, rest_chunk_size);
+            let chunk_data = &buf[bytes_written..bytes_written + len];
+            // 写入数据
+            let n = self.chunk_writer.write(chunk_data).await?;
+            // 更新两种crc
+            self.crc.write(chunk_data);
+            let checksum = self.crc.finish();
+            self.crc = Crc32cHasher::new(checksum as u32);
+            self.global_crc.write(chunk_data);
+            let global_checksum = self.global_crc.finish();
+            self.global_crc = Crc32cHasher::new(global_checksum as u32);
+            // 移动当前pos
+            self.cur_chunk_pos += n;
+            bytes_written += n;
+            debug!(
+                "rest buf len: {}, rest chunk size: {}, bytes_written: {}, current chunk crc: {:x}, current global crc: {:x}, current chunk pos: {}",
+                rest_buf_len - n,
+                rest_chunk_size - n,
+                bytes_written,
+                checksum,
+                global_checksum,
+                self.cur_chunk_pos
+            );
+            // 超出65536时需要写入crc校验码并且重置crc
+            if self.cur_chunk_pos >= self.chunk_size {
+                debug!("current chunk finished, write checksum");
+                self.chunk_writer.write_u32(checksum as u32).await?;
+                //重置chunk crc
+                self.crc = Crc32cHasher::new(0);
+                self.cur_chunk_pos = 0;
+            }
+        }
+        Ok(())
+    }
+
+    // 数据已经写入完成了, 重置global crc
+    pub async fn write_finish_tags(mut self) -> Result<(), ArrowError> {
+        let global_checksum = self.global_crc.finish();
+        debug!(
+            "odps writer finished, global_checksum: {:x}",
+            global_checksum
+        );
+        self.chunk_writer.write_u32(global_checksum as u32).await?;
+        self.chunk_writer.flush().await?;
+        self.global_crc = Crc32cHasher::new(0);
+        self.cur_chunk_pos = 0;
+        Ok(())
+    }
+}

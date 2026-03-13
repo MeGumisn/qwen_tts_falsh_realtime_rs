@@ -1,5 +1,6 @@
 use crate::common::errors::GenerationError;
 use crate::odps::account::SignRequest;
+use crate::odps::async_odps_arrow_writer::AsyncOdpsArrowWriter;
 use crate::odps::constants::insert_default_tunnel_header;
 use crate::odps::models::{
     TunnelDownloadSession, TunnelTableSchema, TunnelUploadSession, TunnelUploadedBlocks,
@@ -11,7 +12,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::ArrowError;
 use bstr::ByteSlice;
 use bytes::Bytes;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use reqwest::header::HeaderMap;
 use reqwest::{Body, Method};
@@ -278,80 +279,74 @@ where
         headers.insert("Transfer-Encoding", "chunked".parse()?);
         headers.insert("Content-Type", "application/octet-stream".parse()?);
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (chunk_writer, chunk_reader) = io::duplex(4);
+        let (chunk_writer, chunk_reader) = io::duplex(10*1024 * 1024-100);
 
-        let rest_client = self.rest_client.clone();
-        let url_str_clone = url_str.clone();
-        let tunnel_endpoint = self.tunnel_endpoint.clone();
+        let write_task = tokio::spawn(async move {
+            // 使用 ? 確保出錯時能立刻拋出，而不是靜默失敗
+            let mut odps_arrow_writer = AsyncOdpsArrowWriter::new(65536, chunk_writer).await
+                .map_err(|e| anyhow::anyhow!("Writer init failed: {:?}", e))?;
 
-        let chunk_writer_task = tokio::spawn(async move {
-            // TODO 这里chunked数据需要包装为 "%x\r\n%b\r\n"
-            let mut writer = chunk_writer;
-            while let Some(payload) = rx.recv().await {
-                // debug!("Chunk received: {:#?}", payload);
-                if let Err(e) = writer.write_all(&payload).await {
-                    break;
-                }
-            }
-            info!("write data finished");
-            let _ = writer.flush().await;
+            odps_arrow_writer.write_record([arrow_data].into_iter()).await?;
+            odps_arrow_writer.write_finish_tags().await?;
+
+            // 強制釋放 writer，這會發送 EOF 給 reader
+            // drop(odps_arrow_writer);
+            Ok::<(), anyhow::Error>(())
         });
 
-        let request_task = tokio::spawn(async move {
-            let stream = ReaderStream::new(chunk_reader);
-            let body = Body::wrap_stream(stream);
-            // 3. 異步處理器：負責發送請求
-            // 這裡可以安全地使用 .await，不會阻塞寫入線程
-            debug!("request started");
-            if let Ok(response) = rest_client
-                .request(
-                    url_str_clone.as_str(),
-                    Method::PUT,
-                    &tunnel_endpoint,
-                    Some(headers),
-                    Some(body),
-                )
-                .await
-            {
-                debug!("request finished, check response: {:#?}", response);
-                let put_success = response.status().is_success();
-                match response.text().await {
-                    Ok(content) => {
-                        if put_success {
-                            info!(
-                                "send data finished, response status is success: {:?}",
-                                content
-                            )
-                        } else {
-                            error!(
-                                "send data finished, response status is failed: {:?}",
-                                content
-                            );
-                            panic!();
-                        }
-                    }
-                    Err(e) => {
-                        error!("send data failed: {:?}", e);
+        // let request_task = tokio::spawn(async move {
+        let mut total_sent = 0;
+        let stream = ReaderStream::new(chunk_reader).inspect(move |item| match item {
+            Ok(data) => {
+                total_sent += data.len();
+                debug!("目前已讀取總計: {} bytes", total_sent);
+            },
+            Err(e) => debug!("从stream中获取数据失败: {:?}", e),
+        });
+        let body = Body::wrap_stream(stream);
+        // 3. 異步處理器：負責發送請求
+        // 這裡可以安全地使用 .await，不會阻塞寫入線程
+        debug!("request started");
+        if let Ok(response) = self
+            .rest_client
+            .request(
+                url_str.as_str(),
+                Method::PUT,
+                self.tunnel_endpoint.as_str(),
+                Some(headers),
+                Some(body),
+            )
+            .await
+        {
+            debug!("request finished, check response: {:#?}", response);
+            let put_success = response.status().is_success();
+            match response.text().await {
+                Ok(content) => {
+                    if put_success {
+                        info!(
+                            "send data finished, response status is success: {:?}",
+                            content
+                        )
+                    } else {
+                        error!(
+                            "send data finished, response status is failed: {:?}",
+                            content
+                        );
                         panic!();
                     }
                 }
+                Err(e) => {
+                    error!("send data failed: {:?}", e);
+                    panic!();
+                }
             }
-        });
-
-
-
-        let mut odps_arrow_writer = OdpsArrowWriter::new(65536, tx).await?;
-        odps_arrow_writer
-            .write_record([arrow_data].into_iter())
-            .await?;
-        odps_arrow_writer.close()?;
-        drop(odps_arrow_writer);
-
-        request_task.await.expect("request_task failed");
-        chunk_writer_task.await.expect("request_task failed");
-
-
+        }
+        // });
+        // 在請求完成後檢查寫入任務
+        // 檢查後台寫入任務是否中途報錯
+        if let Err(e) = write_task.await.unwrap() {
+            error!("Background write task failed: {:?}", e);
+        }
         Ok(())
     }
 
@@ -480,9 +475,9 @@ mod tests {
     #[tokio::test]
     async fn test_open_tunnel_arrow_writer() {
         // 初始化env_logger以查看日志
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .init();
+        // tracing_subscriber::fmt()
+        //     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        //     .init();
         let account = test_account();
         let project_name = "test_dat_maxcompute";
         let table_name = "json_string";
@@ -503,11 +498,8 @@ mod tests {
             .read_to_string(&mut name)
             .unwrap();
         println!("name length: {}", name_len);
-        let record_batch = record_batch!(
-            ("name", Utf8, [name[0..16].to_string()]),
-            ("age", Int64, [4])
-        )
-        .unwrap();
+        let record_batch =
+            record_batch!(("name", Utf8, [name.to_string()]), ("age", Int64, [4])).unwrap();
 
         odps.open_tunnel_arrow_writer(
             None,

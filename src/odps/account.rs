@@ -10,6 +10,7 @@ use reqwest::header::HeaderMap;
 use sha1::Sha1;
 use std::collections::BTreeMap;
 use url::Url;
+use crate::common::logging::init_logger;
 
 pub trait SignRequest {
     fn sign_request(
@@ -222,7 +223,7 @@ impl SignRequest for AliyunAccount<'_> {
 #[cfg(test)]
 pub fn test_account<'a>() -> AliyunAccount<'a> {
     // use crate::common::logging::init_logger;
-    // init_logger("debug");
+    init_logger("debug");
     AliyunAccount::new(env!("ACCESS_ID"), env!("SECRET_KEY"))
 }
 
