@@ -260,7 +260,7 @@ where
         upload_id: &str,
         partition_spec: Option<&str>,
         block_id: Option<&str>,
-        arrow_data: RecordBatch,
+        arrow_data: impl Iterator<Item=RecordBatch> +Send + 'static,
     ) -> Result<(), GenerationError> {
         let project_name: &str = project_name.unwrap_or(self.project_name);
         let block_id = block_id.unwrap_or("0");
@@ -286,7 +286,7 @@ where
             let mut odps_arrow_writer = AsyncOdpsArrowWriter::new(65536, chunk_writer).await
                 .map_err(|e| anyhow::anyhow!("Writer init failed: {:?}", e))?;
 
-            odps_arrow_writer.write_record([arrow_data].into_iter()).await?;
+            odps_arrow_writer.write_record(arrow_data.into_iter()).await?;
             odps_arrow_writer.write_finish_tags().await?;
 
             // 強制釋放 writer，這會發送 EOF 給 reader
@@ -498,8 +498,8 @@ mod tests {
             .read_to_string(&mut name)
             .unwrap();
         println!("name length: {}", name_len);
-        let record_batch =
-            record_batch!(("name", Utf8, [name.to_string()]), ("age", Int64, [4])).unwrap();
+        let record_batches =
+            [record_batch!(("name", Utf8, [name.repeat(40)]), ("age", Int64, [4])).unwrap()];
 
         odps.open_tunnel_arrow_writer(
             None,
@@ -507,7 +507,7 @@ mod tests {
             upload_session.upload_id.as_str(),
             None,
             Some("1"),
-            record_batch,
+            record_batches.into_iter(),
         )
         .await
         .unwrap();

@@ -78,10 +78,10 @@ where
             // 写入数据
             let n = self.chunk_writer.write(chunk_data).await?;
             // 更新两种crc
-            self.crc.write(chunk_data);
+            self.crc.write(&chunk_data[0..n]);
             let checksum = self.crc.finish();
             self.crc = Crc32cHasher::new(checksum as u32);
-            self.global_crc.write(chunk_data);
+            self.global_crc.write(&chunk_data[0..n]);
             let global_checksum = self.global_crc.finish();
             self.global_crc = Crc32cHasher::new(global_checksum as u32);
             // 移动当前pos
